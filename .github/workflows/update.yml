@@ -1,0 +1,52 @@
+name: Auto Merge OmniBox-Spider
+
+on:
+  schedule:
+    # 每 4 天 UTC 03:00 跑一次（北京时间 11:00）
+    - cron: '0 3 */4 * *'
+  workflow_dispatch:  # 允许网页上手动点 Run
+
+permissions:
+  contents: write    # 自动给 GITHUB_TOKEN push 权限
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout 当前仓库
+        uses: actions/checkout@v4
+
+      - name: 🐍 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 🔄 合并所有源仓库
+        run: python merge.py
+
+      - name: 📊 显示结果统计
+        run: |
+          echo "=== merged/ 目录文件 ==="
+          ls -la merged/ || echo "(merged/ 不存在)"
+          echo ""
+          echo "=== 按扩展名统计 ==="
+          cd merged/ && ls -1 2>/dev/null | sed 's/.*\.//' | sort | uniq -c || echo "(无文件)"
+          cd ..
+
+      - name: ⬆️ 提交合并结果
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add merged/
+          git status
+
+          # 如果没有变化就跳过 commit
+          git diff --cached --quiet && echo "nothing to commit" && exit 0
+
+          git commit -m "🤖 auto-merge: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push origin HEAD
+
+      - name: 🐛 失败时通知（可选）
+        if: failure()
+        run: echo "❌ 合并失败，请检查 https://github.com/${{ github.repository }}/actions"
