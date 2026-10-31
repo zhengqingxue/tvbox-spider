@@ -2,19 +2,17 @@
 # -*- coding: utf-8 -*-
 """
 merge.py —— 从多个 OmniBox-Spider 仓库拉取 spider 文件，
-保留原始分类目录结构，智能去重合并，自动生成分类路由表。
+全局按 MD5 去重（内容一样就是同一个，不管文件名、不管路径、不管哪个仓库），
+保留原始分类目录结构。
 
-去重规则（按完整相对路径 + MD5）：
-  - 同路径 + 同 MD5   → 保留 1 份 🟢
-  - 同路径 + 不同 MD5 → 第 1 份原名，后续 _1 _2 后缀 🔵
-  - 不同路径          → 全部保留 🟡
+去重规则：
+  - 内容一样（同 MD5）→ 只留 1 份 🟢，挑最干净的文件名
+  - 内容不一样        → 都保留 🟡
 
 输出：
-  merged/            合并后的 spider 文件（保留分类目录）
-  merged/all_spiders.json  分类路由表（OmniBox 一键导入）
-  merged/README.md    人类可读的 spider 清单
+  merged/            合并后的 spider 文件（保留原始分类目录）
 """
-import os, sys, json, hashlib, shutil, subprocess, tempfile, re
+import os, sys, hashlib, shutil, subprocess, tempfile, re
 from pathlib import Path
 
 # ========== 配置区 ==========
@@ -26,13 +24,10 @@ SOURCE_REPOS = [
     "https://github.com/Silent1566/OmniBox-Spider",
 ]
 OUTPUT_DIR = "merged"
-BRANCH = None          # None=自动探测，或硬编码 "main"
+BRANCH = None
 
-# 要保留的 spider 文件扩展名
 SPIDER_EXTS = {".js", ".py"}
-# 要保留的配置文件扩展名（分类路由表等）
 CONFIG_EXTS = {".json"}
-# 要丢弃的文件（README / test / 拦截器 / 模板 / 定时任务 / .github 等）
 SKIP_DIRS = {".github", ".git", "tests", "模板", "拦截器", "定时任务",
              "已失效待修复", "node_modules"}
 # ========== 配置区 ==========
@@ -74,25 +69,20 @@ def clone_repo(repo_url, dest):
     return True
 
 def should_keep(rel_path):
-    """判断一个文件要不要保留"""
     parts = Path(rel_path).parts
-    # 跳过大写目录
     for p in parts:
         if p in SKIP_DIRS or p.startswith("."):
             return False
     ext = Path(rel_path).suffix.lower()
-    # spider 文件必须有 @name（排除 test/无效的）
     if ext in SPIDER_EXTS:
         return True
     if ext in CONFIG_EXTS:
-        # 只保留分类路由表（包含数字 key 如 '1','2'...的 json）
         if Path(rel_path).name in ("package.json", "package-lock.json", "sync.yml"):
             return False
         return True
     return False
 
 def top_category(rel_path):
-    """取第一级子目录作为分类（影视/短剧/直播/...）"""
     parts = Path(rel_path).parts
     if len(parts) >= 2:
         return parts[0]
@@ -110,9 +100,27 @@ def collect_files(root_dir):
                 result.append((str(rel), f))
     return result
 
+def clean_name(name):
+    """清洗文件名，用于挑选最干净的那份当代表"""
+    stem = Path(name).stem
+    # 去 _1 _2 _3 后缀
+    stem = re.sub(r'_\d+$', '', stem)
+    # 去 [xxx] 方括号
+    stem = re.sub(r'\[.*?\]', '', stem)
+    # 去 -xxx- 前后缀
+    stem = stem.strip('- ')
+    # 去 emoji 前后缀影响，保留核心词
+    return stem
+
+def name_score(e):
+    """文件名打分，越低越好（越干净越短）"""
+    fn = e["fname"]
+    clean = clean_name(fn)
+    return (len(clean), clean)
+
 def main():
     print("=" * 60)
-    print("OmniBox-Spider 智能合并工具 v2")
+    print("OmniBox-Spider 智能合并工具 v3 (MD5 全局去重)")
     print("=" * 60)
 
     if OUT.exists():
@@ -143,16 +151,16 @@ def main():
 
     original_count = sum(len(v) for v in all_files_by_repo.values())
 
-    # ========== 2. 按 文件名 + MD5 全局去重（不管路径） ==========
-    # 同一个蜘蛛在不同仓库、不同子目录出现了好几次，内容一样 → 只留一份
-    # fname -> [(md5, repo, abs_path, rel), ...]
+    # ========== 2. 全局按 MD5 分桶（内容一样就是同一个） ==========
+    # md5 -> [{repo, abs_path, rel, fname}, ...]
     buckets = {}
     for repo, files in all_files_by_repo.items():
         for rel, abs_path in files:
-            fname = Path(rel).name          # ← 纯文件名，忽略子目录
             md5 = md5_of_file(abs_path)
-            buckets.setdefault(fname, []).append({
-                "md5": md5, "repo": repo, "abs_path": abs_path, "rel": rel,
+            fname = Path(rel).name
+            buckets.setdefault(md5, []).append({
+                "md5": md5, "repo": repo, "abs_path": abs_path,
+                "rel": rel, "fname": fname,
             })
 
     # ========== 3. 合并输出 ==========
@@ -160,67 +168,46 @@ def main():
     print(f"合并结果 ({total_repos} 个源仓库, {original_count} 个原始文件)")
     print(f"{'='*60}")
 
-    stats = {"copied": 0, "dedup": 0, "renamed": 0}
-    dir_counts = {}  # 分类名 -> 文件数（用于总结）
+    stats = {"copied": 0, "dedup": 0}
+    dir_counts = {}
 
-    for fname, entries in sorted(buckets.items()):
-        md5_groups = {}
-        for e in entries:
-            md5_groups.setdefault(e["md5"], []).append(e)
+    for md5, entries in sorted(buckets.items()):
+        # 从 MD5 相同的一堆里挑一个最干净的当代表
+        entries_sorted = sorted(entries, key=name_score)
+        winner = entries_sorted[0]
 
-        unique_md5s = list(md5_groups.keys())
+        out_rel = winner["rel"]
+        src = winner["abs_path"]
+        dest_path = OUT / out_rel
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dest_path)
 
-        if len(unique_md5s) == 1:
-            # 所有仓库里这个文件名的内容都一样 → 只保留一份（选第一个的原始分类路径）
-            group = md5_groups[unique_md5s[0]]
-            winner = group[0]  # 选第一份作为代表
-            src = winner["abs_path"]
-            out_rel = winner["rel"]  # 保留它的原始分类路径
-            dest_path = OUT / out_rel
-            dest_path.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dest_path)
-            stats["copied"] += 1
-            stats["dedup"] += len(entries) - 1
-            top_cat = top_category(out_rel)
-            dir_counts[top_cat] = dir_counts.get(top_cat, 0) + 1
-            repos = set(e["repo"] for e in entries)
-            if len(entries) > 1:
-                cats = set(top_category(e["rel"]) for e in entries)
-                print(f"  🟢 {fname}  ×{len(entries)} (跨{len(cats)}个分类,来自{','.join(sorted(repos))}) → {out_rel}")
-            else:
-                print(f"  🟡 {out_rel}")
+        stats["copied"] += 1
+        stats["dedup"] += len(entries) - 1
+        top_cat = top_category(out_rel)
+        dir_counts[top_cat] = dir_counts.get(top_cat, 0) + 1
+
+        all_names = set(e["fname"] for e in entries)
+        repos = set(e["repo"] for e in entries)
+        cats = set(top_category(e["rel"]) for e in entries)
+
+        if len(entries) == 1:
+            print(f"  🟡 {out_rel}")
+        elif len(all_names) == 1:
+            print(f"  🟢 {out_rel}  ×{len(entries)} (跨{len(cats)}分类,来自{','.join(sorted(repos))})")
         else:
-            # 同文件名不同内容 → 第一个原名, 后续 _1 _2
-            for idx, md5 in enumerate(unique_md5s):
-                group = md5_groups[md5]
-                winner = group[0]
-                src = winner["abs_path"]
-                winner_rel = winner["rel"]
-                top_cat = top_category(winner_rel)
-                if idx == 0:
-                    out_rel = winner_rel
-                else:
-                    stem = Path(fname).stem
-                    suffix = Path(fname).suffix
-                    out_rel = str(Path(winner_rel).parent / f"{stem}_{idx}{suffix}")
-                dest_path = OUT / out_rel
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src, dest_path)
-                stats["copied"] += 1
-                dir_counts[top_cat] = dir_counts.get(top_cat, 0) + 1
-                if idx > 0:
-                    stats["renamed"] += 1
-                repos = set(e["repo"] for e in group)
-                print(f"  🔵 {out_rel} (不同版本,来自 {','.join(sorted(repos))})")
+            # 内容一样但文件名不一样 —— 典型的 "木偶.js" vs "木偶_1.js" vs "木偶[v2].js"
+            names_str = ",".join(sorted(all_names))
+            print(f"  🟢 {out_rel}  ×{len(entries)} (同内容,不同文件名: {names_str})")
 
     # ========== 4. 总结 ==========
     print(f"\n{'='*60}")
     print(f"📊 最终总结")
     print(f"{'='*60}")
-    print(f"  原始文件数:   {original_count}")
-    print(f"  合并后文件数: {stats['copied']}")
-    print(f"  去重(相同):   {stats['dedup']}")
-    print(f"  版本改名:     {stats['renamed']}")
+    print(f"  原始文件数:    {original_count}")
+    print(f"  合并后文件数:  {stats['copied']}")
+    print(f"  MD5 去重数量:  {stats['dedup']}")
+    print(f"  压缩率:        {round(stats['dedup']/original_count*100,1)}%")
     print(f"\n📁 分类目录:")
     for cat, n in sorted(dir_counts.items()):
         print(f"  {cat}/  ({n} 个文件)")
