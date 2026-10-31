@@ -143,13 +143,15 @@ def main():
 
     original_count = sum(len(v) for v in all_files_by_repo.values())
 
-    # ========== 2. 按相对路径分组去重 ==========
-    # full_rel_path -> [(md5, repo, abs_path), ...]
+    # ========== 2. 按 文件名 + MD5 全局去重（不管路径） ==========
+    # 同一个蜘蛛在不同仓库、不同子目录出现了好几次，内容一样 → 只留一份
+    # fname -> [(md5, repo, abs_path, rel), ...]
     buckets = {}
     for repo, files in all_files_by_repo.items():
         for rel, abs_path in files:
+            fname = Path(rel).name          # ← 纯文件名，忽略子目录
             md5 = md5_of_file(abs_path)
-            buckets.setdefault(rel, []).append({
+            buckets.setdefault(fname, []).append({
                 "md5": md5, "repo": repo, "abs_path": abs_path, "rel": rel,
             })
 
@@ -161,49 +163,55 @@ def main():
     stats = {"copied": 0, "dedup": 0, "renamed": 0}
     dir_counts = {}  # 分类名 -> 文件数（用于总结）
 
-    for rel, entries in sorted(buckets.items()):
+    for fname, entries in sorted(buckets.items()):
         md5_groups = {}
         for e in entries:
             md5_groups.setdefault(e["md5"], []).append(e)
 
         unique_md5s = list(md5_groups.keys())
-        top_cat = top_category(rel)
 
         if len(unique_md5s) == 1:
-            # 所有仓库里这个路径的文件内容都一样 → 只保留一份原名
-            src = md5_groups[unique_md5s[0]][0]["abs_path"]
-            dest_path = OUT / rel
+            # 所有仓库里这个文件名的内容都一样 → 只保留一份（选第一个的原始分类路径）
+            group = md5_groups[unique_md5s[0]]
+            winner = group[0]  # 选第一份作为代表
+            src = winner["abs_path"]
+            out_rel = winner["rel"]  # 保留它的原始分类路径
+            dest_path = OUT / out_rel
             dest_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dest_path)
             stats["copied"] += 1
             stats["dedup"] += len(entries) - 1
+            top_cat = top_category(out_rel)
             dir_counts[top_cat] = dir_counts.get(top_cat, 0) + 1
             repos = set(e["repo"] for e in entries)
             if len(entries) > 1:
-                print(f"  🟢 {rel}  ×{len(entries)} (相同内容,来自 {','.join(sorted(repos))})")
+                cats = set(top_category(e["rel"]) for e in entries)
+                print(f"  🟢 {fname}  ×{len(entries)} (跨{len(cats)}个分类,来自{','.join(sorted(repos))}) → {out_rel}")
             else:
-                print(f"  🟡 {rel}")
+                print(f"  🟡 {out_rel}")
         else:
-            # 同路径不同内容 → 第一个原名, 后续 _1 _2
+            # 同文件名不同内容 → 第一个原名, 后续 _1 _2
             for idx, md5 in enumerate(unique_md5s):
                 group = md5_groups[md5]
-                src = group[0]["abs_path"]
+                winner = group[0]
+                src = winner["abs_path"]
+                winner_rel = winner["rel"]
+                top_cat = top_category(winner_rel)
                 if idx == 0:
-                    dest_path = OUT / rel
+                    out_rel = winner_rel
                 else:
-                    stem = Path(rel).stem
-                    suffix = Path(rel).suffix
-                    parent = Path(rel).parent
-                    out_rel = str(parent / f"{stem}_{idx}{suffix}") if str(parent) != '.' else f"{stem}_{idx}{suffix}"
-                    dest_path = OUT / out_rel
-                    stats["renamed"] += 1
+                    stem = Path(fname).stem
+                    suffix = Path(fname).suffix
+                    out_rel = str(Path(winner_rel).parent / f"{stem}_{idx}{suffix}")
+                dest_path = OUT / out_rel
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(src, dest_path)
                 stats["copied"] += 1
                 dir_counts[top_cat] = dir_counts.get(top_cat, 0) + 1
+                if idx > 0:
+                    stats["renamed"] += 1
                 repos = set(e["repo"] for e in group)
-                label = f"🔵 {rel}" if idx == 0 else f"🔵 {out_rel}"
-                print(f"  {label} (不同版本,来自 {','.join(sorted(repos))})")
+                print(f"  🔵 {out_rel} (不同版本,来自 {','.join(sorted(repos))})")
 
     # ========== 4. 总结 ==========
     print(f"\n{'='*60}")
