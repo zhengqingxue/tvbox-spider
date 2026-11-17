@@ -2,7 +2,7 @@
 // @author
 // @description 刮削：支持，弹幕：支持，嗅探：支持
 // @dependencies: axios, cheerio
-// @version 1.2.7
+// @version 1.2.21
 // @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/影视/网盘/木偶.js
 
 // 引入 OmniBox SDK
@@ -24,15 +24,24 @@ const https = require("https");
 const fs = require("fs");
 
 // ==================== 配置区域 ====================
-// 网站地址(可以通过环境变量配置,支持多个域名用;分割)
-const WEB_SITE_CONFIG = process.env.WEB_SITE_MUOU || "https://www.muou.site;https://www.muou.asia;https://666.666291.xyz;";
-const WEB_SITES = WEB_SITE_CONFIG.split(';').map(url => url.trim()).filter(url => url);
-// 读取环境变量:支持多个网盘类型,用分号分割
-const DRIVE_TYPE_CONFIG = (process.env.DRIVE_TYPE_CONFIG || "quark;uc").split(';').map(t => t.trim()).filter(t => t);
-// 读取环境变量:线路名称和顺序,用分号分割
-const SOURCE_NAMES_CONFIG = (process.env.SOURCE_NAMES_CONFIG || "本地代理;服务端代理;直连").split(';').map(s => s.trim()).filter(s => s);
+function splitConfigList(value) {
+  return String(value || "")
+    .split(/[;,]/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+// 网站地址(可以通过环境变量配置,支持多个域名用逗号/分号分割)
+const WEB_SITE_CONFIG = process.env.WEB_SITE_MUOU || "https://123.666291.xyz;https://www.muou.asia;https://666.666291.xyz;";
+const WEB_SITES = splitConfigList(WEB_SITE_CONFIG);
+// 读取环境变量:支持多个网盘类型,用逗号/分号分割
+const DRIVE_TYPE_CONFIG = splitConfigList(process.env.DRIVE_TYPE_CONFIG || "quark;uc");
+// 读取环境变量:线路名称和顺序,用逗号/分号分割
+const SOURCE_NAMES_CONFIG = splitConfigList(process.env.SOURCE_NAMES_CONFIG || "本地代理;服务端代理;直连");
+// 是否开启外网服务器代理（默认关闭）
+const EXTERNAL_SERVER_PROXY_ENABLED = String(process.env.EXTERNAL_SERVER_PROXY_ENABLED || "false").toLowerCase() === "true";
 // 读取环境变量:详情页播放线路的网盘排序顺序。仅作用于 detail() 里的播放线路，不作用于搜索结果。
-const DRIVE_ORDER = (process.env.DRIVE_ORDER || "baidu;tianyi;quark;uc;115;xunlei;ali;123pan").split(';').map(s => s.trim().toLowerCase()).filter(Boolean);
+const DRIVE_ORDER = splitConfigList(process.env.DRIVE_ORDER || "baidu;tianyi;quark;uc;115;xunlei;ali;123pan").map(s => s.toLowerCase());
 // 详情链路缓存时间（秒），默认 12 小时
 const MUOU_CACHE_EX_SECONDS = Number(process.env.MUOU_CACHE_EX_SECONDS || 43200);
 const MUOU_VERBOSE_DETAIL = String(process.env.MUOU_VERBOSE_DETAIL || "0") === "1";
@@ -72,6 +81,96 @@ function sortPlaySourcesByDriveOrder(playSources = []) {
     if (aOrder !== bOrder) return aOrder - bOrder;
     return 0;
   });
+}
+
+function resolveCallerSource(params = {}, context = {}) {
+  return String(context?.from || params?.source || "").toLowerCase();
+}
+
+function getBaseURLHost(context = {}) {
+  const baseURL = String(context?.baseURL || "").trim();
+  if (!baseURL) return "";
+  try {
+    return new URL(baseURL).hostname.toLowerCase();
+  } catch (error) {
+    return baseURL.toLowerCase();
+  }
+}
+
+function isPrivateHost(hostname = "") {
+  const host = String(hostname || "").toLowerCase();
+  if (!host) return false;
+  if (host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "0.0.0.0") return true;
+  if (/^(10\.|192\.168\.|169\.254\.)/.test(host)) return true;
+  if (/^172\.(1[6-9]|2\d|3[0-1])\./.test(host)) return true;
+  if (host.endsWith(".local") || host.endsWith(".lan") || host.endsWith(".internal") || host.endsWith(".intra")) return true;
+  if (host.includes(":")) return host.startsWith("fc") || host.startsWith("fd") || host.startsWith("fe80");
+  return false;
+}
+
+function canUseServerProxy(context = {}) {
+  if (EXTERNAL_SERVER_PROXY_ENABLED) return true;
+  return isPrivateHost(getBaseURLHost(context));
+}
+
+function filterSourceNamesForCaller(sourceNames = [], callerSource = "", context = {}) {
+  let filtered = Array.isArray(sourceNames) ? [...sourceNames] : [];
+  const allowServerProxy = canUseServerProxy(context);
+
+  if (callerSource === "web") {
+    filtered = filtered.filter((name) => name !== "本地代理");
+    OmniBox.log("info", "来源为网页端，已过滤掉\"本地代理\"线路");
+  } else if (callerSource === "emby") {
+    if (allowServerProxy) {
+      filtered = filtered.filter((name) => name === "服务端代理");
+      OmniBox.log("info", "来源为 emby，网盘多线路仅保留\"服务端代理\"");
+    } else {
+      filtered = filtered.filter((name) => name !== "服务端代理");
+      OmniBox.log("info", "来源为 emby 但当前为外网环境且未开启外网代理，已屏蔽\"服务端代理\"线路");
+    }
+  } else if (callerSource === "uz") {
+    filtered = filtered.filter((name) => name !== "本地代理");
+    OmniBox.log("info", "来源为 uz，已屏蔽\"本地代理\"线路");
+  }
+
+  if (!allowServerProxy) {
+    filtered = filtered.filter((name) => name !== "服务端代理");
+  }
+
+  return filtered.length > 0 ? filtered : ["直连"];
+}
+
+function resolveRouteType(flag = "", callerSource = "", context = {}) {
+  const allowServerProxy = canUseServerProxy(context);
+  const validRouteTypes = new Set(["本地代理", "服务端代理", "直连"]);
+  let routeType = "直连";
+
+  if (callerSource === "web" || callerSource === "emby") {
+    routeType = allowServerProxy ? "服务端代理" : "直连";
+  }
+
+  if (flag) {
+    if (flag.includes("-")) {
+      const flagParts = flag.split("-");
+      routeType = flagParts[flagParts.length - 1];
+    } else {
+      routeType = flag;
+    }
+  }
+
+  if (!validRouteTypes.has(routeType)) {
+    routeType = "直连";
+  }
+
+  if (!allowServerProxy && routeType === "服务端代理") {
+    routeType = "直连";
+  }
+
+  if (callerSource === "uz" && routeType === "本地代理") {
+    routeType = "直连";
+  }
+
+  return routeType;
 }
 
 if (WEB_SITES.length === 0) {
@@ -117,7 +216,6 @@ function isBlockedHtml(body = "") {
   return (
     lower.includes("just a moment") ||
     lower.includes("cf-browser-verification") ||
-    lower.includes("cloudflare") ||
     lower.includes("captcha") ||
     lower.includes("访问验证")
   );
@@ -1037,12 +1135,9 @@ async function detail(params, context) {
 
       if (targetDriveTypes.includes(driveInfo.driveType)) {
         sourceNames = [...configSourceNames];
-        OmniBox.log("info", `${displayName} 匹配成功,线路设置为: ${sourceNames.join(", ")}`);
-
-        if (source === "web") {
-          sourceNames = sourceNames.filter((name) => name !== "本地代理");
-          OmniBox.log("info", `来源为网页端,已过滤线路`);
-        }
+        OmniBox.log("info", `${displayName} 匹配成功,初始线路设置为: ${sourceNames.join(", ")}`);
+        sourceNames = filterSourceNamesForCaller(sourceNames, source, context);
+        OmniBox.log("info", `来源=${source || "unknown"},最终线路设置为: ${sourceNames.join(", ")}`);
       }
 
       for (const sourceName of sourceNames) {
@@ -1075,6 +1170,9 @@ async function detail(params, context) {
 
           const normalizedOriginalEpisodeName = normalizeEpisodeName(file.file_name || fileName);
           const playMeta = encodePlayMeta({
+            sid: videoId,
+            fid: fileId ? `${shareURL}|${fileId}` : "",
+            v: vodName || "",
             t: vodName,
             e: normalizedOriginalEpisodeName,
           });
@@ -1275,7 +1373,7 @@ async function play(params, context) {
   try {
     const flag = params.flag || "";
     const playId = params.playId || "";
-    const source = params.source || "";
+    const source = resolveCallerSource(params, context);
 
     OmniBox.log("info", `获取播放地址: flag=${flag}, playId=${playId}`);
 
@@ -1288,9 +1386,25 @@ async function play(params, context) {
       throw new Error("播放参数格式错误,应为:分享链接|文件ID");
     }
 
-    const shareURL = idParts[0] || "";
-    const fileId = idParts[1] || "";
-    const videoId = idParts[2] || "";
+    let playMeta = {};
+    let coreParts = [...idParts];
+    if (coreParts.length >= 3) {
+      const possibleMeta = coreParts[coreParts.length - 1] || "";
+      try {
+        playMeta = decodePlayMeta(possibleMeta);
+        if (playMeta && typeof playMeta === "object" && (playMeta.v || playMeta.e || playMeta.fid || playMeta.sid || playMeta.t)) {
+          coreParts = coreParts.slice(0, -1);
+        } else {
+          playMeta = {};
+        }
+      } catch (_) {
+        playMeta = {};
+      }
+    }
+
+    const shareURL = coreParts[0] || "";
+    const fileId = coreParts[1] || "";
+    const videoId = playMeta.sid || coreParts[2] || "";
 
     if (!shareURL || !fileId) {
       throw new Error("分享链接或文件ID不能为空");
@@ -1298,11 +1412,7 @@ async function play(params, context) {
 
     OmniBox.log("info", `解析参数: shareURL=${shareURL}, fileId=${fileId}`);
 
-    let routeType = source === "web" ? "服务端代理" : "直连";
-    if (flag && flag.includes("-")) {
-      const flagParts = flag.split("-");
-      routeType = flagParts[flagParts.length - 1];
-    }
+    const routeType = resolveRouteType(flag, source, context);
     OmniBox.log("info", `使用线路: ${routeType}`);
 
     // 并行: 主链路(播放地址) + 辅链路(刮削元数据/弹幕)
@@ -1310,10 +1420,6 @@ async function play(params, context) {
     const metadataPromise = (async () => {
       const result = {
         danmakuList: [],
-        scrapeTitle: "",
-        scrapePic: "",
-        episodeNumber: null,
-        episodeName: params.episodeName || "",
       };
 
       if (!videoId) return result;
@@ -1321,27 +1427,21 @@ async function play(params, context) {
       try {
         const metadata = await OmniBox.getScrapeMetadata(videoId);
         if (!metadata || !metadata.scrapeData || !Array.isArray(metadata.videoMappings)) {
+          OmniBox.log("info", `木偶 play 弹幕匹配跳过: metadata 不完整, videoId=${videoId}`);
           return result;
         }
 
+        OmniBox.log("info", `木偶 play 弹幕元数据读取成功: videoId=${videoId}, mappings=${metadata.videoMappings.length}, scrapeType=${metadata.scrapeType || "unknown"}`);
+
         const formattedFileId = `${shareURL}|${fileId}|${videoId}`;
+        OmniBox.log("info", `木偶 play 弹幕匹配 formattedFileId=${formattedFileId}`);
         const matchedMapping = metadata.videoMappings.find((mapping) => mapping && mapping.fileId === formattedFileId);
         if (!matchedMapping) {
+          OmniBox.log("info", `木偶 play 弹幕匹配未命中 mapping: formattedFileId=${formattedFileId}`);
           return result;
         }
 
         const scrapeData = metadata.scrapeData;
-        result.scrapeTitle = scrapeData.title || "";
-        if (scrapeData.posterPath) {
-          result.scrapePic = `https://image.tmdb.org/t/p/w500${scrapeData.posterPath}`;
-        }
-
-        if (matchedMapping.episodeNumber) {
-          result.episodeNumber = matchedMapping.episodeNumber;
-        }
-        if (matchedMapping.episodeName && !result.episodeName) {
-          result.episodeName = matchedMapping.episodeName;
-        }
 
         let fileName = "";
         const scrapeType = metadata.scrapeType || "";
@@ -1356,15 +1456,19 @@ async function play(params, context) {
         }
 
         if (fileName) {
-          OmniBox.log("info", `生成fileName用于弹幕匹配: ${fileName}`);
+          OmniBox.log("info", `木偶 play 生成fileName用于弹幕匹配: ${fileName}`);
           const matchedDanmaku = await OmniBox.getDanmakuByFileName(fileName);
-          if (Array.isArray(matchedDanmaku) && matchedDanmaku.length > 0) {
+          const count = Array.isArray(matchedDanmaku) ? matchedDanmaku.length : 0;
+          OmniBox.log("info", `木偶 play 弹幕匹配结果: fileName=${fileName}, count=${count}`);
+          if (count > 0) {
             result.danmakuList = matchedDanmaku;
-            OmniBox.log("info", `弹幕匹配成功,找到 ${matchedDanmaku.length} 条弹幕`);
+            OmniBox.log("info", `木偶 play 弹幕匹配成功,找到 ${count} 条弹幕`);
           }
+        } else {
+          OmniBox.log("info", `木偶 play 弹幕匹配跳过: fileName 为空, formattedFileId=${formattedFileId}`);
         }
       } catch (error) {
-        OmniBox.log("warn", `弹幕匹配失败: ${error.message}`);
+        OmniBox.log("warn", `木偶 play 弹幕匹配失败: ${error.message}`);
       }
 
       return result;
@@ -1382,49 +1486,11 @@ async function play(params, context) {
     }
 
     let danmakuList = [];
-    let scrapeTitle = "";
-    let scrapePic = "";
-    let episodeNumber = null;
-    let episodeName = params.episodeName || "";
 
     if (metadataResult.status === "fulfilled" && metadataResult.value) {
       danmakuList = metadataResult.value.danmakuList || [];
-      scrapeTitle = metadataResult.value.scrapeTitle || "";
-      scrapePic = metadataResult.value.scrapePic || "";
-      episodeNumber = metadataResult.value.episodeNumber || null;
-      episodeName = metadataResult.value.episodeName || episodeName;
     } else if (metadataResult.status === "rejected") {
       OmniBox.log("warn", `获取元数据失败(不影响播放): ${metadataResult.reason && metadataResult.reason.message ? metadataResult.reason.message : metadataResult.reason}`);
-    }
-
-    try {
-      const sourceId = context.sourceId;
-      if (sourceId) {
-        const title = params.title || scrapeTitle || shareURL;
-        const pic = params.pic || scrapePic || "";
-
-        OmniBox.addPlayHistory({
-          vodId: videoId,
-          title: title,
-          pic: pic,
-          episode: playId,
-          sourceId: sourceId,
-          episodeNumber: episodeNumber,
-          episodeName: episodeName,
-        })
-          .then((added) => {
-            if (added) {
-              OmniBox.log("info", `已添加观看记录: ${title}`);
-            } else {
-              OmniBox.log("info", `观看记录已存在,跳过添加: ${title}`);
-            }
-          })
-          .catch((error) => {
-            OmniBox.log("warn", `添加观看记录失败: ${error.message}`);
-          });
-      }
-    } catch (error) {
-      OmniBox.log("warn", `添加观看记录失败: ${error.message}`);
     }
 
     const urlList = playInfo.url || [];
@@ -1436,8 +1502,16 @@ async function play(params, context) {
       });
     }
 
-    const header = playInfo.header || {};
+    let header = playInfo.header || {};
+    const shareURLLower = String(shareURL || "").toLowerCase();
+    const isUcDrive = shareURLLower.includes("drive.uc.cn") || shareURLLower.includes("pc-api.uc.cn") || shareURLLower.includes("uc.cn/s/");
+    if (isUcDrive && routeType == "直连") {
+      header = {};
+      OmniBox.log("info", "木偶 play 命中 UC 直连特判，返回空 header");
+    }
     const finalDanmakuList = danmakuList && danmakuList.length > 0 ? danmakuList : playInfo.danmaku || [];
+
+    OmniBox.log("info", `实际播放地址: ${JSON.stringify(urlsResult)}`);
 
     return {
       urls: urlsResult,
